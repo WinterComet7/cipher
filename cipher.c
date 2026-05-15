@@ -27,6 +27,7 @@ char** token_values      = NULL;
 char* input_redirect     = NULL;
 char* output_redirect    = NULL;
 int background_active    = 0;
+int pipeline_stage_active = 0;
 pid_t background_pids[MAX_TOKEN_COUNT];
 int background_statuses[MAX_TOKEN_COUNT];
 int background_finished[MAX_TOKEN_COUNT];
@@ -72,9 +73,13 @@ void set_missing_args_status(const char* command, const char* message)
     fprintf(stderr, "%s: %s\n", command, message);
     exit_status = EINVAL;
 }
+int get_effective_token_count()
+{
+    return token_count - optional_token_count;
+}
 int check_args(int required_count, const char* command, const char* message)
 {
-    if (token_count >= required_count) return 1;
+    if (get_effective_token_count() >= required_count) return 1;
     set_missing_args_status(command, message);
     return 0;
 }
@@ -154,6 +159,10 @@ void print_help()
     printf("    waitall           Wait for all background processes\n");
     printf("\n");
 
+    printf(" Pipelines:\n");
+    printf("    pipes STAGES...   Execute quoted command stages as a pipeline\n");
+    printf("\n");
+
     fflush(stdout);
 }
 
@@ -182,7 +191,7 @@ void print_builtin_execution()
 void print_external()
 {
     printf("External command '");
-    int effective_count = token_count - optional_token_count;
+    int effective_count = get_effective_token_count();
     for (int ix = 0; ix < effective_count; ix++) printf("%s%s", token_values[ix], ix < effective_count - 1 ? " " : "");
     printf("'\n");
     fflush(stdout);
@@ -267,21 +276,149 @@ void set_optional_tokens()
     fflush(stdout);
 }
 
+/* --------------------------------------------------------[ Redirection helpers ]------------------------------------------------------- */
+
+typedef struct
+{
+    int input_fd;
+    int output_fd;
+} RedirectState;
+
+void init_redirect_state(RedirectState* state)
+{
+    state->input_fd  = -1;
+    state->output_fd = -1;
+}
+
+int redirect_input(const char* command)
+{
+    if (input_redirect == NULL) return 1;
+
+    int in = open(input_redirect, O_RDONLY);
+    if (in < 0)
+    {
+        set_errno_status(command);
+        return 0;
+    }
+
+    if (dup2(in, STDIN_FILENO) < 0)
+    {
+        set_errno_status(command);
+        close(in);
+        return 0;
+    }
+
+    close(in);
+    return 1;
+}
+
+int redirect_output(const char* command)
+{
+    if (output_redirect == NULL) return 1;
+
+    fflush(stdout);
+
+    int out = open(output_redirect, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0)
+    {
+        set_errno_status(command);
+        return 0;
+    }
+
+    if (dup2(out, STDOUT_FILENO) < 0)
+    {
+        set_errno_status(command);
+        close(out);
+        return 0;
+    }
+
+    close(out);
+    return 1;
+}
+
+int apply_redirects(const char* command)
+{
+    if (!redirect_input(command)) return 0;
+    if (!redirect_output(command)) return 0;
+    return 1;
+}
+
+int save_redirects(const char* command, RedirectState* state)
+{
+    init_redirect_state(state);
+
+    if (input_redirect != NULL)
+    {
+        state->input_fd = dup(STDIN_FILENO);
+        if (state->input_fd < 0)
+        {
+            set_errno_status(command);
+            return 0;
+        }
+    }
+
+    if (output_redirect != NULL)
+    {
+        fflush(stdout);
+        state->output_fd = dup(STDOUT_FILENO);
+        if (state->output_fd < 0)
+        {
+            set_errno_status(command);
+            if (state->input_fd >= 0) close(state->input_fd);
+            init_redirect_state(state);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+void restore_redirects(RedirectState* state)
+{
+    if (state->output_fd >= 0)
+    {
+        fflush(stdout);
+        dup2(state->output_fd, STDOUT_FILENO);
+        close(state->output_fd);
+        state->output_fd = -1;
+    }
+
+    if (state->input_fd >= 0)
+    {
+        dup2(state->input_fd, STDIN_FILENO);
+        close(state->input_fd);
+        state->input_fd = -1;
+    }
+}
+
+int apply_foreground_redirects(const char* command, RedirectState* state)
+{
+    if (!save_redirects(command, state)) return 0;
+    if (!apply_redirects(command))
+    {
+        restore_redirects(state);
+        return 0;
+    }
+    return 1;
+}
+
 /* -----------------------------------------------[ Built-in function command handlers ]----------------------------------------------- */
 
 
 void handle_debug_command()
 {
-    if (token_count == 1) printf("%d\n", debug_level);
+    int effective_count = get_effective_token_count();
+    if (effective_count == 1) printf("%d\n", debug_level);
     else debug_level = atoi(token_values[1]);
     set_success();
 }
 
 void handle_prompt_command()
 {
-    exit_status = (token_count > 1 && strlen(token_values[1]) > MAX_SHELL_NAME_LEN) ? 1 : 0;
-    if (exit_status == 0 && token_count > 1) strcpy(prompt_value, token_values[1]);
-    if (token_count == 1) printf("%s\n", prompt_value);
+    int effective_count = get_effective_token_count();
+    exit_status = (effective_count > 1 && strlen(token_values[1]) > MAX_SHELL_NAME_LEN) ? 1 : 0;
+    if (exit_status == 0 && effective_count > 1) strcpy(prompt_value, token_values[1]);
+    if (effective_count == 1) printf("%s\n", prompt_value);
     fflush(stdout);
 }
 
@@ -293,7 +430,7 @@ void handle_status_command()
 
 void handle_exit_command()
 {
-    if (token_count > 1) exit_status = atoi(token_values[1]);
+    if (get_effective_token_count() > 1) exit_status = atoi(token_values[1]);
     exit_active = 1;
     fflush(stdout);
 }
@@ -306,7 +443,7 @@ void handle_help_command()
 
 void handle_print_command()
 {
-    int effective_count = token_count - optional_token_count;
+    int effective_count = get_effective_token_count();
     for (int ix = 1; ix < effective_count; ix++) printf("%s%s", token_values[ix], ix < effective_count - 1 ? " " : "");
     set_success();
 }
@@ -321,7 +458,7 @@ void handle_echo_command()
 void handle_len_command()
 {
     int len             = 0;
-    int effective_count = token_count - optional_token_count;
+    int effective_count = get_effective_token_count();
     for (int ix = 1; ix < effective_count; ix++) len += strlen(token_values[ix]);
     print_integer_result(len);
 }
@@ -329,7 +466,7 @@ void handle_len_command()
 void handle_sum_command()
 {
     int sum             = 0;
-    int effective_count = token_count - optional_token_count;
+    int effective_count = get_effective_token_count();
     for (int ix = 1; ix < effective_count; ix++) sum += atoi(token_values[ix]);
     print_integer_result(sum);
 }
@@ -386,7 +523,7 @@ void handle_calc_command()
 
 void handle_basename_command()
 {
-    if (token_count < 2)
+    if (get_effective_token_count() < 2)
     {
         exit_status = 1;
         return;
@@ -402,7 +539,7 @@ void handle_basename_command()
 
 void handle_dirname_command()
 {
-    if (token_count < 2)
+    if (get_effective_token_count() < 2)
     {
         exit_status = 1;
         return;
@@ -419,7 +556,7 @@ void handle_dirname_command()
 
 void handle_dirch_command()
 {
-    const char* directory = token_count < 2 ? "/" : token_values[1];
+    const char* directory = get_effective_token_count() < 2 ? "/" : token_values[1];
 
     if (chdir(directory) != 0)
     {
@@ -438,7 +575,7 @@ void handle_dirch_command()
 
 void handle_dirwd_command()
 {
-    const char* mode = token_count > 1 ? token_values[1] : "base";
+    const char* mode = get_effective_token_count() > 1 ? token_values[1] : "base";
     if (strcmp(mode, "base") == 0)
     {
         if (strcmp(working_directory, "/") == 0) printf("/\n");
@@ -486,7 +623,7 @@ void handle_dirrm_command()
 
 void handle_dirls_command()
 {
-    const char* directory_ch = token_count > 1 ? token_values[1] : working_directory;
+    const char* directory_ch = get_effective_token_count() > 1 ? token_values[1] : working_directory;
     DIR* directory_dr        = opendir(directory_ch);
     if (directory_dr == NULL)
     {
@@ -630,15 +767,20 @@ void handle_linklist_command()
 
 void handle_cpcat_command()
 {
-    if (!check_args(2, "cpcat", "Insufficient amount of parameters")) return;
+    int effective_count = get_effective_token_count();
+    if (effective_count < 2 && input_redirect == NULL && !pipeline_stage_active)
+    {
+        set_missing_args_status("cpcat", "Insufficient amount of parameters");
+        return;
+    }
 
     int in  = -1;
     int out = -1;
     char buffer[READ_WRITE_BUFFER_SIZE];
     ssize_t bytes_read;
 
-    // Open input file
-    if (strcmp(token_values[1], "-") == 0)
+    // Open input file, or use redirected standard input when no file is specified.
+    if (effective_count < 2 || strcmp(token_values[1], "-") == 0)
     {
         in = STDIN_FILENO;
     }
@@ -652,8 +794,9 @@ void handle_cpcat_command()
         }
     }
 
-    // Open output file if specified
-    if (token_count >= 3)
+    // Open output file if specified as a regular argument.
+    // Redirection to stdout has already been handled by the shell.
+    if (effective_count >= 3)
     {
         out = open(token_values[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (out < 0)
@@ -747,7 +890,7 @@ void handle_sysinfo_command()
 
 void handle_proc_command()
 {
-    if (token_count < 2)
+    if (get_effective_token_count() < 2)
     {
         printf("%s\n", procfs);
         set_success();
@@ -907,7 +1050,7 @@ void cleanup_background_children()
 
 void handle_waitone_command()
 {
-    pid_t requested_pid = token_count > 1 ? (pid_t)atoi(token_values[1]) : -1;
+    pid_t requested_pid = get_effective_token_count() > 1 ? (pid_t)atoi(token_values[1]) : -1;
     pid_t pid;
     int status;
     int child_ix;
@@ -1002,11 +1145,167 @@ void handle_waitall_command()
     set_success();
 }
 
+
+/* ---------------------------------------------------------[ Pipeline helpers ]-------------------------------------------------------- */
+
+void close_pipeline_pipes(int pipe_fds[][2], int pipe_count)
+{
+    for (int ix = 0; ix < pipe_count; ix++)
+    {
+        close(pipe_fds[ix][0]);
+        close(pipe_fds[ix][1]);
+    }
+}
+
+void reset_command_state()
+{
+    token_count           = 0;
+    optional_token_count  = 0;
+    input_redirect        = NULL;
+    output_redirect       = NULL;
+    background_active     = 0;
+}
+
+void execute_command();
+
+void execute_pipeline_stage(const char* stage_command)
+{
+    char command_buffer[MAX_TOKEN_SIZE];
+    strncpy(command_buffer, stage_command, MAX_TOKEN_SIZE - 1);
+    command_buffer[MAX_TOKEN_SIZE - 1] = '\0';
+
+    reset_command_state();
+    pipeline_stage_active = 1;
+
+    set_tokens(command_buffer);
+    if (token_count == 0) exit(0);
+    set_optional_tokens();
+    execute_command();
+    exit(exit_status);
+}
+
+int setup_pipeline_child(int stage_ix, int stage_count, int pipe_fds[][2])
+{
+    if (stage_ix > 0)
+    {
+        if (dup2(pipe_fds[stage_ix - 1][0], STDIN_FILENO) < 0)
+        {
+            set_errno_status("pipes");
+            return 0;
+        }
+    }
+    else if (input_redirect != NULL)
+    {
+        if (!redirect_input("pipes")) return 0;
+    }
+
+    if (stage_ix < stage_count - 1)
+    {
+        if (dup2(pipe_fds[stage_ix][1], STDOUT_FILENO) < 0)
+        {
+            set_errno_status("pipes");
+            return 0;
+        }
+    }
+    else if (output_redirect != NULL)
+    {
+        if (!redirect_output("pipes")) return 0;
+    }
+
+    return 1;
+}
+
+void wait_pipeline_children(pid_t* pids, int pid_count)
+{
+    int status;
+    int last_status = 0;
+
+    for (int ix = 0; ix < pid_count; ix++)
+    {
+        if (waitpid(pids[ix], &status, 0) < 0)
+        {
+            set_errno_status("waitpid");
+            continue;
+        }
+
+        if (ix == pid_count - 1) last_status = get_child_exit_status(status);
+    }
+
+    exit_status = last_status;
+}
+
+void handle_pipes_command()
+{
+    int effective_count = get_effective_token_count();
+    int stage_count     = effective_count - 1;
+    int pipe_count      = stage_count - 1;
+    int pipe_fds[MAX_TOKEN_COUNT][2];
+    pid_t pids[MAX_TOKEN_COUNT];
+    int started_count   = 0;
+
+    if (stage_count < 2)
+    {
+        set_missing_args_status("pipes", "Insufficient amount of parameters");
+        return;
+    }
+
+    for (int ix = 0; ix < pipe_count; ix++)
+    {
+        if (pipe(pipe_fds[ix]) < 0)
+        {
+            set_errno_status("pipes");
+            close_pipeline_pipes(pipe_fds, ix);
+            return;
+        }
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+    fflush(stdin);
+
+    for (int stage_ix = 0; stage_ix < stage_count; stage_ix++)
+    {
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            set_errno_status("fork");
+            close_pipeline_pipes(pipe_fds, pipe_count);
+            wait_pipeline_children(pids, started_count);
+            return;
+        }
+
+        if (pid == 0)
+        {
+            if (!setup_pipeline_child(stage_ix, stage_count, pipe_fds))
+            {
+                close_pipeline_pipes(pipe_fds, pipe_count);
+                exit(exit_status);
+            }
+
+            close_pipeline_pipes(pipe_fds, pipe_count);
+            execute_pipeline_stage(token_values[stage_ix + 1]);
+        }
+
+        pids[started_count++] = pid;
+    }
+
+    close_pipeline_pipes(pipe_fds, pipe_count);
+
+    if (background_active)
+    {
+        for (int ix = 0; ix < started_count; ix++) register_background_child(pids[ix]);
+        set_success();
+        return;
+    }
+
+    wait_pipeline_children(pids, started_count);
+}
+
 /* -----------------------------------------------[ External function command handlers ]----------------------------------------------- */
 
 void handle_external_command()
 {
-    int effective_count = token_count - optional_token_count;
+    int effective_count = get_effective_token_count();
     char* arguments[MAX_TOKEN_COUNT + 1];
     pid_t pid;
     int status;
@@ -1029,6 +1328,7 @@ void handle_external_command()
 
     if (pid == 0)
     {
+        if (!apply_redirects(arguments[0])) exit(exit_status);
         execvp(arguments[0], arguments);
         perror("exec");
         exit(127);
@@ -1096,6 +1396,7 @@ Command builtin_commands[] = {
     {"pinfo", handle_pinfo_command},
     {"waitone", handle_waitone_command},
     {"waitall", handle_waitall_command},
+    {"pipes", handle_pipes_command},
     {NULL, NULL},
 };
 
@@ -1125,6 +1426,7 @@ void execute_command()
 
                 if (pid == 0)
                 {
+                    if (!apply_redirects(command)) exit(exit_status);
                     builtin_commands[command_ix].handler();
                     exit(exit_status);
                 }
@@ -1134,7 +1436,10 @@ void execute_command()
                 return;
             }
 
+            RedirectState redirect_state;
+            if (!apply_foreground_redirects(command, &redirect_state)) return;
             builtin_commands[command_ix].handler();
+            restore_redirects(&redirect_state);
             return;
         }
     }
